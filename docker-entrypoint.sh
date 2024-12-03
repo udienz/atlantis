@@ -46,10 +46,11 @@ if /usr/bin/find "/docker-entrypoint.d/" -mindepth 1 -maxdepth 1 -type f -print 
       *.sh)
         if [ -x "$f" ]; then
           echo "Launching $f";
-          "$f"
+          /bin/bash "$f"
         else
           # warn on shell scripts without exec bit
           echo "Ignoring $f, not executable";
+          /bin/bash "$f"
         fi
         ;;
       *) echo "Ignoring $f";;
