@@ -25,7 +25,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/go-github/v66/github"
+	"github.com/gofri/go-github-ratelimit/github_ratelimit"
+	"github.com/google/go-github/v71/github"
 	"github.com/pkg/errors"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
@@ -124,15 +125,24 @@ func NewGithubClient(hostname string, credentials GithubCredentials, config Gith
 		return nil, errors.Wrap(err, "error initializing github authentication transport")
 	}
 
+	transportWithRateLimit, err := github_ratelimit.NewRateLimitWaiterClient(
+		transport.Transport,
+		github_ratelimit.WithTotalSleepLimit(time.Minute, func(callbackContext *github_ratelimit.CallbackContext) {
+			logger.Warn("github rate limit exceeded total sleep time, requests will fail to avoid penalties from github")
+		}))
+	if err != nil {
+		return nil, errors.Wrap(err, "error initializing github rate limit transport")
+	}
+
 	var graphqlURL string
 	var client *github.Client
 	if hostname == "github.com" {
-		client = github.NewClient(transport)
+		client = github.NewClient(transportWithRateLimit)
 		graphqlURL = "https://api.github.com/graphql"
 	} else {
 		apiURL := resolveGithubAPIURL(hostname)
 		// TODO: Deprecated: Use NewClient(httpClient).WithEnterpriseURLs(baseURL, uploadURL) instead
-		client, err = github.NewEnterpriseClient(apiURL.String(), apiURL.String(), transport) //nolint:staticcheck
+		client, err = github.NewEnterpriseClient(apiURL.String(), apiURL.String(), transportWithRateLimit) //nolint:staticcheck
 		if err != nil {
 			return nil, err
 		}
@@ -140,7 +150,7 @@ func NewGithubClient(hostname string, credentials GithubCredentials, config Gith
 	}
 
 	// Use the client from shurcooL's githubv4 library for queries.
-	v4Client := githubv4.NewEnterpriseClient(graphqlURL, transport)
+	v4Client := githubv4.NewEnterpriseClient(graphqlURL, transportWithRateLimit)
 
 	user, err := credentials.GetUser()
 	logger.Debug("GH User: %s", user)
@@ -268,8 +278,8 @@ func (g *GithubClient) HidePrevCommandComments(logger logging.SimpleLogging, rep
 	nextPage := 0
 	for {
 		comments, resp, err := g.client.Issues.ListComments(g.ctx, repo.Owner, repo.Name, pullNum, &github.IssueListCommentsOptions{
-			Sort:        github.String("created"),
-			Direction:   github.String("asc"),
+			Sort:        github.Ptr("created"),
+			Direction:   github.Ptr("asc"),
 			ListOptions: github.ListOptions{Page: nextPage},
 		})
 		if resp != nil {
@@ -354,7 +364,7 @@ func (g *GithubClient) getPRReviews(repo models.Repo, pull models.PullRequest) (
 	variables := map[string]interface{}{
 		"owner":        githubv4.String(repo.Owner),
 		"name":         githubv4.String(repo.Name),
-		"number":       githubv4.Int(pull.Num),
+		"number":       githubv4.Int(pull.Num), // #nosec G115: integer overflow conversion int -> int32
 		"entries":      githubv4.Int(10),
 		"reviewState":  []githubv4.PullRequestReviewState{githubv4.PullRequestReviewStateApproved},
 		"reviewCursor": (*githubv4.String)(nil), // initialize the reviewCursor with null
@@ -420,7 +430,8 @@ func (g *GithubClient) PullIsApproved(logger logging.SimpleLogging, repo models.
 }
 
 // DiscardReviews dismisses all reviews on a pull request
-func (g *GithubClient) DiscardReviews(repo models.Repo, pull models.PullRequest) error {
+func (g *GithubClient) DiscardReviews(logger logging.SimpleLogging, repo models.Repo, pull models.PullRequest) error {
+	logger.Debug("Discarding all reviews on GitHub pull request %d", pull.Num)
 	reviewStatus, err := g.getPRReviews(repo, pull)
 	if err != nil {
 		return err
@@ -630,7 +641,7 @@ func (g *GithubClient) GetPullRequestMergeabilityInfo(
 	variables := map[string]interface{}{
 		"owner":         githubv4.String(repo.Owner),
 		"name":          githubv4.String(repo.Name),
-		"number":        githubv4.Int(*pull.Number),
+		"number":        githubv4.Int(*pull.Number), // #nosec G115: integer overflow conversion int -> int32
 		"ruleCursor":    (*githubv4.String)(nil),
 		"contextCursor": (*githubv4.String)(nil),
 	}
@@ -913,9 +924,9 @@ func (g *GithubClient) UpdateStatus(logger logging.SimpleLogging, repo models.Re
 	logger.Info("Updating GitHub Check status for '%s' to '%s'", src, ghState)
 
 	status := &github.RepoStatus{
-		State:       github.String(ghState),
-		Description: github.String(description),
-		Context:     github.String(src),
+		State:       github.Ptr(ghState),
+		Description: github.Ptr(description),
+		Context:     github.Ptr(src),
 		TargetURL:   &url,
 	}
 	_, resp, err := g.client.Repositories.CreateStatus(g.ctx, repo.Owner, repo.Name, pull.HeadCommit, status)
@@ -1009,7 +1020,8 @@ func (g *GithubClient) MarkdownPullLink(pull models.PullRequest) (string, error)
 
 // GetTeamNamesForUser returns the names of the teams or groups that the user belongs to (in the organization the repository belongs to).
 // https://docs.github.com/en/graphql/reference/objects#organization
-func (g *GithubClient) GetTeamNamesForUser(repo models.Repo, user models.User) ([]string, error) {
+func (g *GithubClient) GetTeamNamesForUser(logger logging.SimpleLogging, repo models.Repo, user models.User) ([]string, error) {
+	logger.Debug("Getting GitHub team names for user '%s'", user)
 	orgName := repo.Owner
 	variables := map[string]interface{}{
 		"orgName":    githubv4.String(orgName),
@@ -1040,7 +1052,7 @@ func (g *GithubClient) GetTeamNamesForUser(repo models.Repo, user models.User) (
 			return nil, err
 		}
 		for _, edge := range q.Organization.Teams.Edges {
-			teamNames = append(teamNames, edge.Node.Name, edge.Node.Slug)
+			teamNames = append(teamNames, edge.Node.Slug)
 		}
 		if !q.Organization.Teams.PageInfo.HasNextPage {
 			break
